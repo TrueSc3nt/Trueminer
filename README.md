@@ -32,11 +32,12 @@ pip install -r requirements.txt
 
 ### Run
 ```bash
-# Interactive setup
+# Interactive setup (recommended)
 python miner.py
 
-# CLI with GPU + BCH
-python miner.py --gpu --bch --bch-addr YOUR_BCH_ADDRESS --no-prompt
+# CLI with all options
+python miner.py --gpu --bch --bch-addr YOUR_BCH_ADDRESS \
+  --tg-token YOUR_BOT_TOKEN --tg-chat YOUR_CHAT_ID --no-prompt
 
 # Or use the batch file (Windows)
 run.bat
@@ -64,6 +65,22 @@ run.bat
 
 **Auto mode:** Starts at difficulty 1, doubles when shares come in, halves when silent for 1 hour.
 
+## Telegram Setup
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) on Telegram
+2. Copy the bot token (format: `123456789:ABCdefGHIjklMNOpqrSTUvwxYZ`)
+3. Get your chat ID by messaging [@userinfobot](https://t.me/userinfobot)
+4. Enter both when prompted during setup, or use CLI:
+```bash
+python miner.py --tg-token "YOUR_BOT_TOKEN" --tg-chat "YOUR_CHAT_ID"
+```
+
+### Telegram Notifications
+- **GPU Share Found** — When GPU finds a valid share
+- **Block Found** — When a block is solved
+- **Share Accepted** — When pool accepts a share
+- **Startup** — Miner configuration summary
+
 ## CLI Options
 
 ```
@@ -75,6 +92,8 @@ run.bat
 --bch-pool H:P     BCH pool (default: solo.bchpool.org:3333)
 --pool1 H:P        BTC pool 1 (default: solo.ckpool.org:3333)
 --pool2 H:P        BTC pool 2 (default: solo.stratum.braiins.com:3333)
+--tg-token TOKEN   Telegram bot token
+--tg-chat ID       Telegram chat ID
 --no-prompt        Skip interactive setup
 ```
 
@@ -103,12 +122,10 @@ cryptocrackersminer/
 ├── gpu_miner.py          # CUDA GPU wrapper
 ├── sha256_cuda.cu        # CUDA kernel source
 ├── sha256_cuda.h         # C API header
-├── sha256_cuda.dll       # Compiled CUDA library (not in repo)
-├── sha256_miner.dll      # CPU C extension
-├── sha256_shani.dll      # SHA-NI extension
 ├── requirements.txt      # Python dependencies
-├── run.bat               # Windows launcher
+├── run.bat               # Windows launcher (5 modes)
 ├── run_cpu_only.bat      # CPU-only launcher
+├── README.md             # This file
 └── .gitignore
 ```
 

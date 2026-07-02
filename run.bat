@@ -24,6 +24,17 @@ echo     [8] Fixed difficulty 8
 set /p diff="  Select GPU difficulty [0]: "
 if "%diff%"=="" set diff=0
 
+echo.
+set /p tg_use="  Enable Telegram notifications? (y/n) [n]: "
+set TG_FLAG=
+if /I "%tg_use%"=="y" (
+    set /p tg_token="  Telegram Bot Token: "
+    set /p tg_chat="  Telegram Chat ID: "
+    if defined tg_token if defined tg_chat (
+        set TG_FLAG=--tg-token !tg_token! --tg-chat !tg_chat!
+    )
+)
+
 set GPU_FLAG=
 if "%choice%"=="1" set GPU_FLAG=--gpu
 if "%choice%"=="3" set GPU_FLAG=--gpu --gpu-only --bch
@@ -34,21 +45,10 @@ if not "%diff%"=="0" (
     set GPU_FLAG=%GPU_FLAG% --gpu-diff %diff%
 )
 
-if "%choice%"=="1" (
-    echo Starting BTC mining with GPU...
-) else if "%choice%"=="2" (
+if "%choice%"=="2" (
     echo Starting BTC mining with CPU only...
-    set GPU_FLAG=--no-prompt
-) else if "%choice%"=="3" (
-    echo Starting BTC + BCH with GPU only...
-) else if "%choice%"=="4" (
-    echo Starting BTC + BCH with CPU only...
-) else if "%choice%"=="5" (
-    echo Starting BTC + BCH with CPU + GPU...
+    python miner.py --no-prompt %TG_FLAG%
 ) else (
-    echo Starting BTC mining with GPU...
-    set GPU_FLAG=--gpu
+    python miner.py %GPU_FLAG% --no-prompt %TG_FLAG%
 )
-
-python miner.py %GPU_FLAG% --no-prompt
 pause

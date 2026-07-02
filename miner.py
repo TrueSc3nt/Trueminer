@@ -32,12 +32,12 @@ except ImportError:
 
 IS_WINDOWS = platform.system() == "Windows"
 CPU_COUNT  = mp.cpu_count()
-BTC_ADDRESS = "bc1qke9ets26d6vs8ardndteds57frcald98n8g3te"
-BCH_ADDRESS = "bitcoincash:qpf8gg2d9r8e0ln2r0lhl9q0s3sjk6mz2qgfuq0fvs"  # Set your BCH address
+BTC_ADDRESS = ""
+BCH_ADDRESS = ""
 DIFF1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 
-TG_TOKEN = "6582191802:AAHBO-n98I5vw2th2llW-2BcWZeOWNZq1po"
-TG_CHAT  = "5592132168"
+TG_TOKEN = ""
+TG_CHAT  = ""
 
 # Pool definitions
 POOLS = [
@@ -675,7 +675,8 @@ class AISoloMinerV8:
     NUM_REGIONS = 32
 
     def __init__(self, address=BTC_ADDRESS, num_cores=None, use_gpu=False,
-                 gpu_only=False, gpu_difficulty=0, bch_address=None, bch_pools=None):
+                 gpu_only=False, gpu_difficulty=0, bch_address=None, bch_pools=None,
+                 tg_token="", tg_chat=""):
         self.address    = address
         self.bch_address = bch_address
         self.shutdown   = False
@@ -684,6 +685,8 @@ class AISoloMinerV8:
         self.use_gpu    = use_gpu
         self.gpu_only   = gpu_only
         self.gpu_manual_diff = gpu_difficulty  # 0 = auto, >0 = fixed difficulty
+        self.tg_token   = tg_token
+        self.tg_chat    = tg_chat
 
         # Pool connections
         self.pools: List[PoolConnection] = []
@@ -756,7 +759,7 @@ class AISoloMinerV8:
         self.share_times:   List[float] = []
 
         # Telegram
-        self.telegram = TelegramAlert(TG_TOKEN, TG_CHAT)
+        self.telegram = TelegramAlert(self.tg_token, self.tg_chat)
 
         self._init_db()
 
@@ -1121,7 +1124,25 @@ class AISoloMinerV8:
                     hr = pool_hrs.get(p.name, 0.0)
                     lines.append(f"    {p.name:8s} {st:8s}  HR={fmt_hr(hr):>10s}  diff={p.pool_diff:.2f}  acc={acc.get(p.name,0)} rej={rej.get(p.name,0)}")
 
-                # GPU
+    # Telegram notifications
+    print()
+    tg_choice = input("  Enable Telegram notifications? (y/n) [n]: ").strip().lower()
+    use_tg = tg_choice in ("y", "yes")
+
+    tg_token = ""
+    tg_chat = ""
+    if use_tg:
+        tg_token = input("  Telegram Bot Token: ").strip()
+        tg_chat = input("  Telegram Chat ID: ").strip()
+        if tg_token and tg_chat:
+            print("  Telegram notifications enabled")
+        else:
+            print("  Telegram disabled (missing token or chat ID)")
+            use_tg = False
+            tg_token = ""
+            tg_chat = ""
+
+    # GPU
                 if self.gpu_workers:
                     gpu_p = self.gpu_workers[0]
                     gpu_st = "RUNNING" if gpu_p.is_alive() else "DEAD"
@@ -1572,6 +1593,7 @@ def interactive_setup():
         print(f"  BCH Addr: {bch_address}")
         bch_pool_str = " + ".join([f"{p['host']}:{p['port']}" for p in bch_pools]) if bch_pools else "None"
         print(f"  BCH Pool: {bch_pool_str}")
+    print(f"  Telegram: {'Enabled' if tg_token and tg_chat else 'Disabled'}")
     print(f"  Cores   : {cores}/{avail}")
     print("-" * 60)
 
@@ -1580,7 +1602,7 @@ def interactive_setup():
         print("  Cancelled.")
         sys.exit(0)
 
-    return addr, selected_pools, use_gpu, cores, gpu_difficulty, bch_address if use_bch else None, bch_pools if use_bch else []
+    return addr, selected_pools, use_gpu, cores, gpu_difficulty, bch_address if use_bch else None, bch_pools if use_bch else [], tg_token, tg_chat
 
 
 def main():
@@ -1596,6 +1618,8 @@ def main():
     parser.add_argument('--bch', nargs='?', const=True, default=None, help='Enable BCH dual mining (optionally pass BCH address)')
     parser.add_argument('--bch-addr', default=None, help='Bitcoin Cash address for BCH mining')
     parser.add_argument('--gpu-diff', type=float, default=0, help='GPU difficulty (0=auto adaptive, 1-10000=manual fixed)')
+    parser.add_argument('--tg-token', default=None, help='Telegram bot token')
+    parser.add_argument('--tg-chat', default=None, help='Telegram chat ID')
     parser.add_argument('--pool1', default=None, help='Pool 1 host:port (e.g. solo.ckpool.org:3333)')
     parser.add_argument('--pool2', default=None, help='Pool 2 host:port (e.g. solo.stratum.braiins.com:3333)')
     parser.add_argument('--bch-pool', default=None, help='BCH pool host:port (e.g. solo.bchpool.org:3333)')
@@ -1605,7 +1629,7 @@ def main():
     # Interactive setup if no address and not --no-prompt
     if args.address is None and not args.no_prompt:
         try:
-            addr, selected_pools, use_gpu, cores, gpu_difficulty, bch_address, bch_pools = interactive_setup()
+            addr, selected_pools, use_gpu, cores, gpu_difficulty, bch_address, bch_pools, tg_token, tg_chat = interactive_setup()
         except (KeyboardInterrupt, EOFError):
             print("\n  Cancelled.")
             return
@@ -1614,6 +1638,8 @@ def main():
         use_gpu = args.gpu
         gpu_only = args.gpu_only
         gpu_difficulty = args.gpu_diff
+        tg_token = args.tg_token or ""
+        tg_chat = args.tg_chat or ""
         cores = None
         bch_address = None
         bch_pools = []
@@ -1687,7 +1713,9 @@ def main():
     AISoloMinerV8(addr, CPU_COUNT, use_gpu=use_gpu, gpu_only=gpu_only,
                   gpu_difficulty=gpu_difficulty,
                   bch_address=bch_address,
-                  bch_pools=bch_pools).start()
+                  bch_pools=bch_pools,
+                  tg_token=tg_token,
+                  tg_chat=tg_chat).start()
 
 if __name__ == "__main__":
     main()
