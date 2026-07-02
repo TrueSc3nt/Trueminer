@@ -1,4 +1,4 @@
-# CryptoCrackersMiner
+# TrueMiner
 
 **BTC + BCH Dual Solo Miner with CUDA GPU Support**
 
@@ -25,8 +25,8 @@ Mine Bitcoin and Bitcoin Cash simultaneously on solo mining pools using both CPU
 
 ### Install
 ```bash
-git clone https://github.com/TrueSc3nt/cryptocrackersminer.git
-cd cryptocrackersminer
+git clone https://github.com/TrueSc3nt/TrueMiner.git
+cd TrueMiner
 pip install -r requirements.txt
 ```
 
@@ -117,7 +117,7 @@ python miner.py --tg-token "YOUR_BOT_TOKEN" --tg-chat "YOUR_CHAT_ID"
 ## Project Structure
 
 ```
-cryptocrackersminer/
+TrueMiner/
 ├── miner.py              # Main miner (BTC + BCH, CPU + GPU)
 ├── gpu_miner.py          # CUDA GPU wrapper
 ├── sha256_cuda.cu        # CUDA kernel source

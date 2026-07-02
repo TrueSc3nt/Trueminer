@@ -1232,7 +1232,7 @@ class AISoloMinerV8:
         bch_str = f"\n  BCH: {self.bch_address or 'Not set'}\n  BCH Pools: {bch_pool_names}" if self.bch_pools else ""
         safe_print(f"""
 ===============================================================
-       CryptoCrackersMiner v1 - BTC + BCH Dual Mine
+       TrueMiner v1 - BTC + BCH Dual Mine
   BTC: {self.address}
   BTC Pools: {btc_pool_names}{bch_str}
   CPU + C Extension{gpu_str}

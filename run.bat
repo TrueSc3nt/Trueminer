@@ -3,7 +3,7 @@ echo Installing dependencies...
 pip install -q numpy requests psutil scikit-learn
 echo.
 echo ================================================================
-echo   CryptoCrackersMiner v1 - BTC + BCH Dual Mine
+echo   TrueMiner v1 - BTC + BCH Dual Mine
 echo ================================================================
 echo.
 echo   [1] BTC only (GPU)
