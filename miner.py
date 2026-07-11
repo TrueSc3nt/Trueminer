@@ -1297,6 +1297,13 @@ def sv2_selftest():
 #  POOL CONNECTION
 # ═══════════════════════════════════════════════════════════════
 
+class PoolAuthError(Exception):
+    """Raised when a pool rejects mining.authorize (e.g. missing/invalid
+    address). This is a permanent error for the given credentials, so the
+    connect() retry/backoff loop treats it as fatal instead of retrying."""
+    pass
+
+
 class PoolConnection:
     def __init__(self, pool_id, name, host, port, address, authority_key=None):
         self.pool_id  = pool_id
@@ -1330,6 +1337,9 @@ class PoolConnection:
         self.pool_diff: float = 1.0
         self.share_target: int = 2**256-1
         self.job_data: dict = {}
+        # Bytes read during the sv1 handshake that belong to the listener
+        # (e.g. the first mining.notify / set_difficulty a pool bundles in).
+        self.recv_backlog = ""
         self.connected = False
         # Negotiated Stratum protocol for the live connection: "sv1" or "sv2".
         # Defaults to sv1 (the classic path) until detection says otherwise.
@@ -1361,6 +1371,9 @@ class PoolConnection:
                     if self._connect_sv2_once():
                         return True
                 raise ConnectionError("stratum handshake failed")
+            except PoolAuthError as e:
+                safe_print(f"[POOL:{self.name}] Not retrying - set a valid address and restart. ({e})")
+                return False
             except Exception as e:
                 wait = min(120, 5*(2**attempt))
                 safe_print(f"[POOL:{self.name}] Retry in {wait}s... ({e})")
@@ -1377,15 +1390,68 @@ class PoolConnection:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(60)
         s.connect((self.host, self.port))
+
+        # Buffered, newline-delimited JSON reader. Pools (e.g. ckpool) commonly
+        # bundle the first mining.set_difficulty / mining.notify into the same
+        # TCP segments as the subscribe/authorize replies, so we must parse
+        # complete lines and RETAIN anything that isn't the reply we're waiting
+        # for (instead of discarding it and losing the first job).
+        buf = ""
+        early = []
+        def _read_lines():
+            nonlocal buf
+            data = s.recv(4096).decode("utf-8", errors="ignore")
+            if not data:
+                raise ConnectionError("pool closed connection during handshake")
+            buf += data
+            parts = buf.split("\n")
+            buf = parts[-1]
+            return [p for p in parts[:-1] if p.strip()]
+
         s.sendall((json.dumps({"id":1,"method":"mining.subscribe",
             "params":["AISoloMinerV8/8.0"]})+"\n").encode())
-        resp = json.loads(s.recv(4096).decode().split('\n')[0])
-        if resp.get('result'):
-            self.extranonce1      = resp['result'][1]
-            self.extranonce2_size = resp['result'][2]
+        subscribed = False
+        for _ in range(10):
+            for line in _read_lines():
+                try: msg = json.loads(line)
+                except Exception: continue
+                if msg.get("id") == 1 and msg.get("result"):
+                    self.extranonce1      = msg["result"][1]
+                    self.extranonce2_size = msg["result"][2]
+                    subscribed = True
+                else:
+                    early.append(line)
+            if subscribed: break
+        if not subscribed:
+            raise ConnectionError("no subscribe response")
+
         s.sendall((json.dumps({"id":2,"method":"mining.authorize",
             "params":[self.address,"x"]})+"\n").encode())
-        s.recv(4096)
+        authorized = None
+        for _ in range(10):
+            for line in _read_lines():
+                try: msg = json.loads(line)
+                except Exception: continue
+                if msg.get("id") == 2 and "result" in msg:
+                    authorized = msg
+                else:
+                    early.append(line)
+            if authorized is not None: break
+        if authorized is None:
+            raise ConnectionError("no authorize response")
+        if authorized.get("result") is not True:
+            err = authorized.get("error") or "authorization rejected"
+            coin = "BCH" if self.pool_id >= 100 else "BTC"
+            shown = self.address if self.address else "(empty)"
+            safe_print(f"[POOL:{self.name}] LOGIN REJECTED: {err}")
+            safe_print(f"[POOL:{self.name}] -> Set a valid {coin} address as your username "
+                       f"(current: {shown}).")
+            raise PoolAuthError(str(err))
+
+        # Hand any early notify/set_difficulty (plus a partial trailing
+        # fragment) to the listener so the first job is not lost.
+        self.recv_backlog = ("\n".join(early) + "\n" if early else "") + buf
+
         self.sock = s
         self.connected = True
         self.protocol = "sv1"
@@ -1683,8 +1749,31 @@ class AISoloMinerV8:
 
     # ── POOL LISTENERS ────────────────────────────────────────
 
+    def _handle_stratum_line(self, pool: PoolConnection, line: str):
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        LOG.info(f"[POOL:{pool.name}] {line.strip()[:120]}")
+        m = msg.get('method')
+        if m == 'mining.notify':
+            self._dispatch(pool, msg['params'])
+        elif m == 'mining.set_difficulty':
+            self._set_diff(pool, msg['params'])
+        elif m is None and 'result' in msg and msg.get('id') not in (1, 2):
+            self._handle_response(pool, msg)
+
     def listen_for_jobs(self, pool: PoolConnection):
-        buf=''; errors=0
+        # Prime the buffer with anything the handshake read ahead (e.g. the
+        # first mining.notify / set_difficulty that ckpool bundles in) so the
+        # first job is processed immediately and never lost.
+        buf = pool.recv_backlog or ''
+        pool.recv_backlog = ''
+        errors = 0
+        if buf:
+            pre = buf.split('\n'); buf = pre[-1]
+            for line in pre[:-1]:
+                if line.strip(): self._handle_stratum_line(pool, line)
         while not self.shutdown:
             try:
                 if not pool.sock: time.sleep(1); continue
@@ -1697,17 +1786,7 @@ class AISoloMinerV8:
                 buf+=chunk; lines=buf.split('\n'); buf=lines[-1]
                 for line in lines[:-1]:
                     if not line.strip(): continue
-                    try:
-                        msg=json.loads(line)
-                        LOG.info(f"[POOL:{pool.name}] {line.strip()[:120]}")
-                        m=msg.get('method')
-                        if m=='mining.notify':
-                            self._dispatch(pool, msg['params'])
-                        elif m=='mining.set_difficulty':
-                            self._set_diff(pool, msg['params'])
-                        elif m is None and 'result' in msg and msg.get('id') not in(1,2):
-                            self._handle_response(pool, msg)
-                    except json.JSONDecodeError: pass
+                    self._handle_stratum_line(pool, line)
                 time.sleep(0.005)
             except socket.timeout: continue
             except Exception as e:
