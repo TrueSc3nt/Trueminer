@@ -16,7 +16,7 @@ v9 changes:
 
 import os, sys, json, time, socket, hashlib, binascii, logging
 import random, threading, platform, ctypes
-import struct, sqlite3, subprocess
+import struct, sqlite3, subprocess, hmac
 import multiprocessing as mp
 from multiprocessing import Process, Queue, Value, Array
 import numpy as np
@@ -270,11 +270,17 @@ def worker_process(
             while True:
                 new_job = job_queue.get_nowait()
                 current_job = new_job
-                en2_size = new_job.get('_en2_size', 4)
-                en2_val  = random.randint(0, 2**(8*en2_size)-1)
-                current_en2 = format(en2_val, f'0{2*en2_size}x')
-                current_prefix = build_prefix(
-                    new_job, new_job.get('_en1',''), current_en2)
+                # SV2 standard-channel jobs arrive with a fully built 76-byte
+                # header prefix (no client-side coinbase/extranonce rolling).
+                if new_job.get('_prebuilt_prefix'):
+                    current_prefix = new_job['_prebuilt_prefix']
+                    current_en2 = ''
+                else:
+                    en2_size = new_job.get('_en2_size', 4)
+                    en2_val  = random.randint(0, 2**(8*en2_size)-1)
+                    current_en2 = format(en2_val, f'0{2*en2_size}x')
+                    current_prefix = build_prefix(
+                        new_job, new_job.get('_en1',''), current_en2)
         except: pass
 
         if not current_job or not current_prefix:
@@ -319,7 +325,7 @@ def worker_process(
                 best_hash_val.value = float(best_seen)
                 best_hex_str = format(best_seen,'064x')
 
-            if random.random() < 0.05:
+            if not current_job.get('_prebuilt_prefix') and random.random() < 0.05:
                 en2_size = current_job.get('_en2_size', 4)
                 en2_val  = random.randint(0, 2**(8*en2_size)-1)
                 current_en2 = format(en2_val, f'0{2*en2_size}x')
@@ -412,11 +418,15 @@ def gpu_worker_process(
             while True:
                 new_job = job_queue.get_nowait()
                 current_job = new_job
-                en2_size = new_job.get('_en2_size', 4)
-                en2_val = random.randint(0, 2**(8*en2_size)-1)
-                current_en2 = format(en2_val, f'0{2*en2_size}x')
-                current_prefix = build_prefix_for_gpu(
-                    new_job, new_job.get('_en1', ''), current_en2)
+                if new_job.get('_prebuilt_prefix'):
+                    current_prefix = new_job['_prebuilt_prefix']
+                    current_en2 = ''
+                else:
+                    en2_size = new_job.get('_en2_size', 4)
+                    en2_val = random.randint(0, 2**(8*en2_size)-1)
+                    current_en2 = format(en2_val, f'0{2*en2_size}x')
+                    current_prefix = build_prefix_for_gpu(
+                        new_job, new_job.get('_en1', ''), current_en2)
                 last_header_hex = None
                 LOG.info(f"[GPU] Received job {new_job.get('job_id', '?')} from {new_job.get('_pool_name', '?')}")
         except:
@@ -507,7 +517,7 @@ def gpu_worker_process(
                 total_hashes = 0
                 last_report = now
 
-            if random.random() < 0.05:
+            if not current_job.get('_prebuilt_prefix') and random.random() < 0.05:
                 en2_size = current_job.get('_en2_size', 4)
                 en2_val = random.randint(0, 2**(8*en2_size)-1)
                 current_en2 = format(en2_val, f'0{2*en2_size}x')
@@ -595,16 +605,726 @@ class TelegramAlert:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  STRATUM PROTOCOL DETECTION (sv1 / sv2)
+# ═══════════════════════════════════════════════════════════════
+
+# URL scheme prefixes used to explicitly request a Stratum protocol on a
+# per-pool basis. Anything else is auto-detected at connect time.
+SV2_SCHEMES = ("stratum2+tcp://", "stratum2://", "sv2+tcp://", "sv2://")
+SV1_SCHEMES = ("stratum+tcp://", "stratum1+tcp://", "stratum://", "tcp://")
+
+
+def parse_pool_scheme(host):
+    """Split an optional protocol scheme off a pool host.
+
+    Returns (clean_host, hint) where hint is 'sv2', 'sv1' or 'auto'.
+    Existing plain hostnames (no scheme) resolve to 'auto' so behaviour is
+    unchanged for pools configured the classic way.
+    """
+    h = (host or "").strip()
+    low = h.lower()
+    for sch in SV2_SCHEMES:
+        if low.startswith(sch):
+            return h[len(sch):], "sv2"
+    for sch in SV1_SCHEMES:
+        if low.startswith(sch):
+            return h[len(sch):], "sv1"
+    return h, "auto"
+
+
+def sv2_ephemeral_pubkey():
+    """Return a 32-byte X25519 ephemeral public key for the sv2 Noise
+    handshake initiation. Uses `cryptography` when available; otherwise a
+    random 32-byte value, which is sufficient for a detection-only probe
+    because the sv2 responder replies with its own handshake message before
+    verifying anything."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        priv = X25519PrivateKey.generate()
+        return priv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    except Exception:
+        return os.urandom(32)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STRATUM V2 (SV2) - Noise transport + binary codec + mining
+# ═══════════════════════════════════════════════════════════════
+#
+# This block implements a pure-Python Stratum V2 client good enough to open a
+# STANDARD mining channel and mine on it. The design goals are:
+#   * Coin-agnostic transport/codec (BTC, BC2/BitcoinII, BCH, bch2, ...).
+#   * Reuse of the existing SHA-256d worker/hashing/submit pipeline.
+#   * Safe, transparent fallback to the proven sv1 path on ANY failure.
+#
+# Handshake variant implemented: Noise_NX_25519_ChaChaPoly_SHA256
+#   (X25519 ECDH, ChaCha20-Poly1305 AEAD, SHA-256, HKDF). This is the classic
+#   SV2 handshake and the one implementable with the `cryptography` package.
+#   NOTE: the current sv2-spec has since migrated to a secp256k1+EllSwift
+#   variant which is not implementable in pure Python without libsecp256k1;
+#   pools still speaking the 25519 handshake work, others fall back to sv1.
+#
+# The pool's authority public key is used only for OPTIONAL certificate
+# verification (server authentication). Because NX transmits the responder's
+# static key during the handshake, the encrypted channel is established even
+# without the authority key; verification is best-effort and never fatal.
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey, X25519PublicKey)
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives import serialization as _crypto_ser
+    HAS_CRYPTOGRAPHY = True
+except Exception:
+    HAS_CRYPTOGRAPHY = False
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    HAS_ED25519 = True
+except Exception:
+    HAS_ED25519 = False
+
+# Known SV2 authority key for mkpool BitcoinII (bc2). Used as a default
+# pre-fill only; never assumed for other pools.
+MKPOOL_BC2_AUTHORITY_KEY = "9c9aZWzETaiJyqGGUSCn8GqFgTpxs96ert4d4jGeRnvxqRqhZar"
+
+# SV2 message type identifiers (from the sv2-spec).
+SV2_MT_SETUP_CONNECTION                 = 0x00
+SV2_MT_SETUP_CONNECTION_SUCCESS         = 0x01
+SV2_MT_SETUP_CONNECTION_ERROR           = 0x02
+SV2_MT_CHANNEL_ENDPOINT_CHANGED         = 0x03
+SV2_MT_OPEN_STANDARD_MINING_CHANNEL     = 0x10
+SV2_MT_OPEN_STANDARD_MINING_CHANNEL_OK  = 0x11
+SV2_MT_OPEN_MINING_CHANNEL_ERROR        = 0x12
+SV2_MT_UPDATE_CHANNEL                   = 0x16
+SV2_MT_UPDATE_CHANNEL_ERROR             = 0x17
+SV2_MT_CLOSE_CHANNEL                    = 0x18
+SV2_MT_SET_EXTRANONCE_PREFIX            = 0x19
+SV2_MT_SUBMIT_SHARES_STANDARD           = 0x1a
+SV2_MT_SUBMIT_SHARES_EXTENDED           = 0x1b
+SV2_MT_SUBMIT_SHARES_SUCCESS            = 0x1c
+SV2_MT_SUBMIT_SHARES_ERROR              = 0x1d
+SV2_MT_NEW_MINING_JOB                   = 0x1e
+SV2_MT_NEW_EXTENDED_MINING_JOB          = 0x1f
+SV2_MT_SET_NEW_PREV_HASH                = 0x20
+SV2_MT_SET_TARGET                       = 0x21
+SV2_MT_RECONNECT                        = 0x25
+
+SV2_CHANNEL_MSG_BIT = 0x8000
+# SetupConnection mining-protocol flag: client only understands standard jobs.
+SV2_FLAG_REQUIRES_STANDARD_JOBS = 0x00000001
+
+
+class Sv2Error(Exception):
+    pass
+
+
+# ── SV2 primitive (de)serialisation. All multi-byte ints little-endian. ──
+
+def _sv2_u8(v):   return struct.pack('<B', v & 0xff)
+def _sv2_u16(v):  return struct.pack('<H', v & 0xffff)
+def _sv2_u24(v):
+    v &= 0xffffff
+    return bytes((v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff))
+def _sv2_u32(v):  return struct.pack('<I', v & 0xffffffff)
+def _sv2_u64(v):  return struct.pack('<Q', v & 0xffffffffffffffff)
+def _sv2_f32(v):  return struct.pack('<f', float(v))
+def _sv2_u256(v):
+    """int -> 32-byte little-endian U256."""
+    return int(v).to_bytes(32, 'little')
+def _sv2_str0_255(s):
+    b = s.encode('utf-8') if isinstance(s, str) else bytes(s)
+    b = b[:255]
+    return _sv2_u8(len(b)) + b
+def _sv2_b0_32(b):
+    b = bytes(b)[:32]
+    return _sv2_u8(len(b)) + b
+def _sv2_option_u32(v):
+    return _sv2_u8(0) if v is None else (_sv2_u8(1) + _sv2_u32(v))
+
+
+class _Sv2Reader:
+    """Cursor-based reader for SV2 serialized payloads."""
+    def __init__(self, data):
+        self.d = data
+        self.i = 0
+    def take(self, n):
+        if self.i + n > len(self.d):
+            raise Sv2Error("sv2 payload short read")
+        r = self.d[self.i:self.i + n]
+        self.i += n
+        return r
+    def u8(self):   return self.take(1)[0]
+    def u16(self):  return struct.unpack('<H', self.take(2))[0]
+    def u24(self):
+        b = self.take(3)
+        return b[0] | (b[1] << 8) | (b[2] << 16)
+    def u32(self):  return struct.unpack('<I', self.take(4))[0]
+    def u64(self):  return struct.unpack('<Q', self.take(8))[0]
+    def f32(self):  return struct.unpack('<f', self.take(4))[0]
+    def u256(self): return self.take(32)            # raw 32 bytes (LE order)
+    def str0_255(self):
+        return self.take(self.u8()).decode('utf-8', 'ignore')
+    def b0_32(self):
+        return self.take(self.u8())
+    def option_u32(self):
+        return self.u32() if self.u8() != 0 else None
+
+
+def sv2_frame_header(msg_type, payload_len, channel_msg=False):
+    """Build the 6-byte SV2 frame header (ext_type U16, msg_type U8, len U24)."""
+    ext = SV2_CHANNEL_MSG_BIT if channel_msg else 0x0000
+    return _sv2_u16(ext) + _sv2_u8(msg_type) + _sv2_u24(payload_len)
+
+
+def sv2_parse_frame_header(hdr6):
+    ext = struct.unpack('<H', hdr6[0:2])[0]
+    msg_type = hdr6[2]
+    length = hdr6[3] | (hdr6[4] << 8) | (hdr6[5] << 16)
+    return ext, msg_type, length
+
+
+# ── SV2 message builders (only what a standard-channel miner needs) ──
+
+def sv2_msg_setup_connection(endpoint_host, endpoint_port,
+                             flags=0, protocol=0,
+                             vendor="TrueCryptoMiner", firmware="v9"):
+    p  = _sv2_u8(protocol)
+    p += _sv2_u16(2)                       # min_version
+    p += _sv2_u16(2)                       # max_version
+    p += _sv2_u32(flags)
+    p += _sv2_str0_255(endpoint_host)
+    p += _sv2_u16(endpoint_port)
+    p += _sv2_str0_255(vendor)
+    p += _sv2_str0_255("")                 # hardware_version
+    p += _sv2_str0_255(firmware)
+    p += _sv2_str0_255("")                 # device_id
+    return p
+
+
+def sv2_msg_open_standard_channel(request_id, user_identity,
+                                  nominal_hash_rate, max_target_int):
+    p  = _sv2_u32(request_id)
+    p += _sv2_str0_255(user_identity)
+    p += _sv2_f32(nominal_hash_rate)
+    p += _sv2_u256(max_target_int)
+    return p
+
+
+def sv2_msg_submit_shares_standard(channel_id, sequence_number, job_id,
+                                   nonce, ntime, version):
+    p  = _sv2_u32(channel_id)
+    p += _sv2_u32(sequence_number)
+    p += _sv2_u32(job_id)
+    p += _sv2_u32(nonce)
+    p += _sv2_u32(ntime)
+    p += _sv2_u32(version)
+    return p
+
+
+# ── SV2 message parsers ──
+
+def sv2_parse_setup_connection_success(payload):
+    r = _Sv2Reader(payload)
+    return {"used_version": r.u16(), "flags": r.u32()}
+
+
+def sv2_parse_setup_connection_error(payload):
+    r = _Sv2Reader(payload)
+    return {"flags": r.u32(), "error_code": r.str0_255()}
+
+
+def sv2_parse_open_standard_channel_success(payload):
+    r = _Sv2Reader(payload)
+    return {
+        "request_id":        r.u32(),
+        "channel_id":        r.u32(),
+        "target":            int.from_bytes(r.u256(), 'little'),
+        "extranonce_prefix": r.b0_32(),
+        "group_channel_id":  r.u32(),
+    }
+
+
+def sv2_parse_open_channel_error(payload):
+    r = _Sv2Reader(payload)
+    return {"request_id": r.u32(), "error_code": r.str0_255()}
+
+
+def sv2_parse_new_mining_job(payload):
+    r = _Sv2Reader(payload)
+    return {
+        "channel_id":  r.u32(),
+        "job_id":      r.u32(),
+        "min_ntime":   r.option_u32(),
+        "version":     r.u32(),
+        "merkle_root": r.u256(),          # raw 32 bytes, header order
+    }
+
+
+def sv2_parse_set_new_prev_hash(payload):
+    r = _Sv2Reader(payload)
+    return {
+        "channel_id": r.u32(),
+        "job_id":     r.u32(),
+        "prev_hash":  r.u256(),           # raw 32 bytes, header order
+        "min_ntime":  r.u32(),
+        "nbits":      r.u32(),
+    }
+
+
+def sv2_parse_set_target(payload):
+    r = _Sv2Reader(payload)
+    return {
+        "channel_id":     r.u32(),
+        "maximum_target": int.from_bytes(r.u256(), 'little'),
+    }
+
+
+def sv2_parse_submit_shares_success(payload):
+    r = _Sv2Reader(payload)
+    return {
+        "channel_id":                 r.u32(),
+        "last_sequence_number":       r.u32(),
+        "new_submits_accepted_count": r.u32(),
+        "new_shares_sum":             r.u64(),
+    }
+
+
+def sv2_parse_submit_shares_error(payload):
+    r = _Sv2Reader(payload)
+    return {
+        "channel_id":      r.u32(),
+        "sequence_number": r.u32(),
+        "error_code":      r.str0_255(),
+    }
+
+
+def nbits_int_to_target(nbits):
+    """Compact-bits (as an int, e.g. from SV2 U32) -> full 256-bit target."""
+    exp  = (nbits >> 24) & 0xff
+    mant = nbits & 0xffffff
+    if exp <= 3:
+        return mant >> (8 * (3 - exp))
+    return mant << (8 * (exp - 3))
+
+
+def byteswap_u32(n):
+    """Reinterpret the 4 big-endian bytes of n as a little-endian U32.
+
+    The worker builds headers with the nonce appended as big-endian hex, so
+    the 4 header nonce bytes are n.to_bytes(4,'big'). SV2 SubmitSharesStandard
+    carries the nonce as a U32 whose little-endian serialization must equal
+    those same 4 bytes, hence this swap keeps the submitted header identical
+    to the one that was actually hashed.
+    """
+    return int.from_bytes(int(n).to_bytes(4, 'big'), 'little')
+
+
+# ── base58 / authority key handling (best-effort, verification only) ──
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def base58_decode(s):
+    num = 0
+    for ch in s:
+        idx = _B58_ALPHABET.find(ch)
+        if idx < 0:
+            raise Sv2Error(f"invalid base58 char {ch!r}")
+        num = num * 58 + idx
+    body = num.to_bytes((num.bit_length() + 7) // 8, 'big') if num else b''
+    n_pad = len(s) - len(s.lstrip('1'))
+    return b'\x00' * n_pad + body
+
+
+def decode_authority_pubkey(key_str):
+    """Best-effort decode of a base58(-check) authority key to its 32-byte
+    public key. Returns None if it cannot be interpreted. Never raises."""
+    if not key_str:
+        return None
+    try:
+        raw = base58_decode(key_str.strip())
+    except Exception:
+        return None
+    # Strip a trailing 4-byte base58check checksum when present.
+    if len(raw) in (36, 38):
+        raw = raw[:-4]
+    # Strip a leading version prefix (commonly 2 bytes, e.g. [1,0]).
+    if len(raw) == 34:
+        raw = raw[2:]
+    elif len(raw) > 32:
+        raw = raw[-32:]
+    return raw if len(raw) == 32 else None
+
+
+# ── Noise cipher / handshake state ──
+
+class Sv2CipherState:
+    """Post-handshake AEAD state with a monotonically increasing 64-bit nonce
+    (per Noise: 4 zero bytes || little-endian counter)."""
+    def __init__(self, key):
+        self.key = key
+        self.n = 0
+        self.aead = ChaCha20Poly1305(key) if (key and HAS_CRYPTOGRAPHY) else None
+
+    def _nonce(self):
+        return b'\x00\x00\x00\x00' + self.n.to_bytes(8, 'little')
+
+    def encrypt(self, ad, pt):
+        if self.aead is None:
+            return pt
+        ct = self.aead.encrypt(self._nonce(), pt, ad)
+        self.n += 1
+        return ct
+
+    def decrypt(self, ad, ct):
+        if self.aead is None:
+            return ct
+        pt = self.aead.decrypt(self._nonce(), ct, ad)
+        self.n += 1
+        return pt
+
+
+class Sv2Handshake:
+    """Symmetric+handshake state for Noise_NX_25519_ChaChaPoly_SHA256."""
+    PROTOCOL_NAME = b"Noise_NX_25519_ChaChaPoly_SHA256"   # exactly 32 bytes
+
+    def __init__(self):
+        # protocolName is exactly 32 bytes -> used directly as initial h.
+        self.h = self.PROTOCOL_NAME
+        self.ck = self.h
+        self.h = hashlib.sha256(self.h).digest()   # MixHash(empty prologue)
+        self.k = None
+        self.n = 0
+
+    def mix_hash(self, data):
+        self.h = hashlib.sha256(self.h + data).digest()
+
+    @staticmethod
+    def _hkdf2(ck, ikm):
+        tk = hmac.new(ck, ikm, hashlib.sha256).digest()
+        o1 = hmac.new(tk, b'\x01', hashlib.sha256).digest()
+        o2 = hmac.new(tk, o1 + b'\x02', hashlib.sha256).digest()
+        return o1, o2
+
+    def mix_key(self, ikm):
+        self.ck, self.k = self._hkdf2(self.ck, ikm)
+        self.n = 0
+
+    def _nonce(self):
+        return b'\x00\x00\x00\x00' + self.n.to_bytes(8, 'little')
+
+    def encrypt_and_hash(self, pt):
+        if self.k is None:
+            self.mix_hash(pt)
+            return pt
+        ct = ChaCha20Poly1305(self.k).encrypt(self._nonce(), pt, self.h)
+        self.n += 1
+        self.mix_hash(ct)
+        return ct
+
+    def decrypt_and_hash(self, ct):
+        if self.k is None:
+            self.mix_hash(ct)
+            return ct
+        pt = ChaCha20Poly1305(self.k).decrypt(self._nonce(), ct, self.h)
+        self.n += 1
+        self.mix_hash(ct)
+        return pt
+
+    def split(self):
+        t1, t2 = self._hkdf2(self.ck, b'')
+        return Sv2CipherState(t1), Sv2CipherState(t2)
+
+
+def _x25519_pub_bytes(priv):
+    return priv.public_key().public_bytes(
+        _crypto_ser.Encoding.Raw, _crypto_ser.PublicFormat.Raw)
+
+
+def _x25519_dh(priv, peer_pub_bytes):
+    return priv.exchange(X25519PublicKey.from_public_bytes(peer_pub_bytes))
+
+
+class Sv2Transport:
+    """Framed, Noise-encrypted SV2 transport over a TCP socket.
+
+    After handshake_initiator() succeeds, send_message()/recv_message()
+    exchange SV2 frames encrypted per sv2-spec section 4.6 (header encrypted
+    as a 22-byte block, payload encrypted in <=65519-byte chunks)."""
+
+    MAX_PT = 65519
+    MAX_CT = 65535
+    MAC    = 16
+
+    def __init__(self, sock):
+        self.sock = sock
+        self._buf = b''
+        self.send_cs = None      # initiator -> responder
+        self.recv_cs = None      # responder -> initiator
+        self.rs_pubkey = None    # server static public key (from handshake)
+        self.cert_verified = False
+
+    # -- low level byte IO --
+    def _recv_exact(self, n):
+        while len(self._buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise Sv2Error("sv2 connection closed")
+            self._buf += chunk
+        r, self._buf = self._buf[:n], self._buf[n:]
+        return r
+
+    def settimeout(self, t):
+        try:
+            self.sock.settimeout(t)
+        except Exception:
+            pass
+
+    # -- Noise NX handshake (initiator) --
+    def handshake_initiator(self, authority_key=None):
+        if not HAS_CRYPTOGRAPHY:
+            raise Sv2Error("cryptography package required for sv2 handshake")
+        hs = Sv2Handshake()
+        e_priv = X25519PrivateKey.generate()
+        e_pub = _x25519_pub_bytes(e_priv)
+        hs.mix_hash(e_pub)
+        hs.encrypt_and_hash(b'')                      # empty payload (k empty)
+        self.sock.sendall(e_pub)                      # Act 1: -> e (32 bytes)
+
+        msg = self._recv_exact(170)                   # Act 2: 32 + 48 + 90
+        re_pub = msg[0:32]
+        hs.mix_hash(re_pub)
+        hs.mix_key(_x25519_dh(e_priv, re_pub))        # ee
+        rs_pub = hs.decrypt_and_hash(msg[32:80])      # s  (32 + 16 MAC)
+        hs.mix_key(_x25519_dh(e_priv, rs_pub))        # es
+        sig_msg = hs.decrypt_and_hash(msg[80:170])    # SIGNATURE_NOISE_MESSAGE
+
+        self.rs_pubkey = rs_pub
+        self.send_cs, self.recv_cs = hs.split()
+        self.cert_verified = self._verify_certificate(
+            authority_key, rs_pub, sig_msg)
+        return True
+
+    def _verify_certificate(self, authority_key, server_static, sig_msg):
+        """Optional server authentication. Non-fatal: returns True/False and
+        never raises. The 25519-era certificate signature is Ed25519 over
+        (version||valid_from||not_valid_after||server_static_pubkey)."""
+        ak = decode_authority_pubkey(authority_key)
+        if ak is None or not HAS_ED25519 or len(sig_msg) < 10:
+            return False
+        try:
+            r = _Sv2Reader(sig_msg)
+            version = r.u16()
+            valid_from = r.u32()
+            not_valid_after = r.u32()
+            signature = r.take(64)
+            signed = (_sv2_u16(version) + _sv2_u32(valid_from)
+                      + _sv2_u32(not_valid_after) + server_static)
+            Ed25519PublicKey.from_public_bytes(ak).verify(signature, signed)
+            return True
+        except Exception:
+            return False
+
+    # -- framed encrypted messaging --
+    @staticmethod
+    def _pt_len_to_ct_len(pt_len):
+        remainder = pt_len % Sv2Transport.MAX_PT
+        if remainder > 0:
+            remainder += Sv2Transport.MAC
+        return pt_len // Sv2Transport.MAX_PT * Sv2Transport.MAX_CT + remainder
+
+    def send_message(self, msg_type, payload, channel_msg=False):
+        header = sv2_frame_header(msg_type, len(payload), channel_msg)
+        out = self.send_cs.encrypt(b'', header)          # 6 -> 22 bytes
+        off = 0
+        if not payload:
+            self.sock.sendall(out)
+            return
+        while off < len(payload):
+            chunk = payload[off:off + self.MAX_PT]
+            out += self.send_cs.encrypt(b'', chunk)
+            off += self.MAX_PT
+        self.sock.sendall(out)
+
+    def recv_message(self):
+        """Returns (msg_type, payload). Blocks until a full frame arrives."""
+        enc_header = self._recv_exact(6 + self.MAC)      # 22 bytes
+        header = self.recv_cs.decrypt(b'', enc_header)
+        _ext, msg_type, length = sv2_parse_frame_header(header)
+        payload = b''
+        if length:
+            ct_len = self._pt_len_to_ct_len(length)
+            enc_payload = self._recv_exact(ct_len)
+            off = 0
+            while off < len(enc_payload):
+                take = min(self.MAX_CT, len(enc_payload) - off)
+                payload += self.recv_cs.decrypt(b'', enc_payload[off:off + take])
+                off += take
+        return msg_type, payload
+
+
+def sv2_noise_responder_reply(recv_exact, send_all, static_priv, sig_msg):
+    """Responder side of the NX handshake. Used ONLY by the offline self-test
+    to validate the initiator implementation end-to-end. Returns the responder
+    (send_cs, recv_cs) pair, where the responder sends with recv_cs and
+    receives with send_cs (mirror of the initiator)."""
+    hs = Sv2Handshake()
+    re_pub = recv_exact(32)
+    hs.mix_hash(re_pub)
+    hs.decrypt_and_hash(b'')
+    e_priv = X25519PrivateKey.generate()
+    e_pub = _x25519_pub_bytes(e_priv)
+    out = e_pub
+    hs.mix_hash(e_pub)
+    hs.mix_key(_x25519_dh(e_priv, re_pub))               # ee
+    out += hs.encrypt_and_hash(_x25519_pub_bytes(static_priv))   # s
+    hs.mix_key(_x25519_dh(static_priv, re_pub))          # es
+    out += hs.encrypt_and_hash(sig_msg)
+    send_all(out)
+    c1, c2 = hs.split()
+    return c1, c2
+
+
+def sv2_selftest():
+    """Offline validation of the sv2 codec, Noise NX handshake and encrypted
+    transport. Runs the initiator against an in-process responder over a local
+    socket pair; needs no network. Returns True on success."""
+    ok = True
+
+    # ---- binary codec round-trips ----
+    try:
+        assert sv2_parse_frame_header(
+            sv2_frame_header(SV2_MT_NEW_MINING_JOB, 100, True)) == \
+            (SV2_CHANNEL_MSG_BIT, SV2_MT_NEW_MINING_JOB, 100)
+        assert sv2_parse_frame_header(
+            sv2_frame_header(SV2_MT_SUBMIT_SHARES_STANDARD, 0xffffff, False))[2] == 0xffffff
+
+        mr = bytes(range(32))
+        njm = (_sv2_u32(7) + _sv2_u32(42) + _sv2_option_u32(123456)
+               + _sv2_u32(0x20000000) + mr)
+        j = sv2_parse_new_mining_job(njm)
+        assert (j['channel_id'] == 7 and j['job_id'] == 42
+                and j['min_ntime'] == 123456 and j['version'] == 0x20000000
+                and j['merkle_root'] == mr)
+
+        njm2 = (_sv2_u32(7) + _sv2_u32(43) + _sv2_option_u32(None)
+                + _sv2_u32(1) + mr)
+        assert sv2_parse_new_mining_job(njm2)['min_ntime'] is None
+
+        ph = (_sv2_u32(7) + _sv2_u32(42) + bytes(range(32))
+              + _sv2_u32(1700000000) + _sv2_u32(0x1d00ffff))
+        p = sv2_parse_set_new_prev_hash(ph)
+        assert p['nbits'] == 0x1d00ffff and p['min_ntime'] == 1700000000
+
+        ss = sv2_msg_submit_shares_standard(7, 1, 42, 0xdeadbeef, 1700000000, 0x20000000)
+        r = _Sv2Reader(ss)
+        assert (r.u32() == 7 and r.u32() == 1 and r.u32() == 42
+                and r.u32() == 0xdeadbeef and r.u32() == 1700000000
+                and r.u32() == 0x20000000)
+
+        assert nbits_int_to_target(0x1d00ffff) == DIFF1
+        assert byteswap_u32(0x01020304) == 0x04030201
+        safe_print("[SELFTEST] codec: PASS")
+    except Exception as e:
+        ok = False
+        safe_print(f"[SELFTEST] codec: FAIL {e}")
+
+    # ---- Noise NX handshake + encrypted transport ----
+    if not HAS_CRYPTOGRAPHY:
+        safe_print("[SELFTEST] noise: SKIP ('cryptography' not installed)")
+    else:
+        a = b = None
+        try:
+            a, b = socket.socketpair()
+            static = X25519PrivateKey.generate()
+            sig_msg = _sv2_u16(0) + _sv2_u32(0) + _sv2_u32(0xffffffff) + bytes(64)
+            result = {}
+
+            def _responder():
+                def rx(n):
+                    d = b''
+                    while len(d) < n:
+                        c = b.recv(n - len(d))
+                        if not c:
+                            raise Sv2Error("closed")
+                        d += c
+                    return d
+                c1, c2 = sv2_noise_responder_reply(rx, b.sendall, static, sig_msg)
+                result['c1'], result['c2'] = c1, c2
+
+            th = threading.Thread(target=_responder)
+            th.start()
+
+            tr = Sv2Transport(a)
+            tr.handshake_initiator(None)
+            th.join(timeout=10)
+            if 'c1' not in result:
+                raise Sv2Error("responder handshake did not complete")
+
+            resp_tr = Sv2Transport(b)
+            resp_tr.recv_cs = result['c1']   # initiator -> responder
+            resp_tr.send_cs = result['c2']   # responder -> initiator
+
+            payload = b"hello sv2 world" * 10
+            tr.send_message(SV2_MT_SETUP_CONNECTION, payload)
+            mt, got = resp_tr.recv_message()
+            assert mt == SV2_MT_SETUP_CONNECTION and got == payload
+
+            payload2 = os.urandom(200)
+            resp_tr.send_message(SV2_MT_NEW_MINING_JOB, payload2, channel_msg=True)
+            mt2, got2 = tr.recv_message()
+            assert mt2 == SV2_MT_NEW_MINING_JOB and got2 == payload2
+
+            safe_print("[SELFTEST] noise handshake + transport: PASS")
+        except Exception as e:
+            ok = False
+            safe_print(f"[SELFTEST] noise: FAIL {e}")
+        finally:
+            for s in (a, b):
+                if s is not None:
+                    try: s.close()
+                    except: pass
+
+    ak = decode_authority_pubkey(MKPOOL_BC2_AUTHORITY_KEY)
+    safe_print(f"[SELFTEST] mkpool bc2 authority key: "
+               f"{'decoded ' + str(len(ak)) + ' bytes' if ak else 'could not decode'}")
+    safe_print(f"[SELFTEST] RESULT: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+# ═══════════════════════════════════════════════════════════════
 #  POOL CONNECTION
 # ═══════════════════════════════════════════════════════════════
 
 class PoolConnection:
-    def __init__(self, pool_id, name, host, port, address):
+    def __init__(self, pool_id, name, host, port, address, authority_key=None):
         self.pool_id  = pool_id
         self.name     = name
-        self.host     = host
+        # A pool URL may carry an explicit protocol scheme (e.g.
+        # "stratum2+tcp://host") and, for sv2, an authority key in the path
+        # (e.g. "stratum2+tcp://host/AUTHKEY"). Strip both and remember the
+        # hint so we can negotiate sv2 vs sv1 automatically at connect time.
+        clean_host, self.protocol_hint = parse_pool_scheme(host)
+        if '/' in clean_host:
+            clean_host, _, path = clean_host.partition('/')
+            if path and not authority_key:
+                authority_key = path
+        self.host     = clean_host
         self.port     = port
         self.address  = address
+        # SV2 authority (Noise static) public key for optional server auth.
+        self.authority_key = authority_key
+        # SV2 live-session state (populated by _connect_sv2_once()).
+        self.sv2: Optional[Sv2Transport] = None
+        self.sv2_channel_id   = 0
+        self.sv2_extranonce   = b''
+        self.sv2_target       = 0
+        self.sv2_prevhash     = None
+        self.sv2_jobs_meta    = {}      # job_id -> parsed NewMiningJob dict
+        self.sv2_submit_meta  = {}      # job_id -> {version, ntime, channel_id}
+        self.sv2_seq          = 0
         self.sock: Optional[socket.socket] = None
         self.extranonce1      = ''
         self.extranonce2_size = 4
@@ -612,33 +1332,214 @@ class PoolConnection:
         self.share_target: int = 2**256-1
         self.job_data: dict = {}
         self.connected = False
+        # Negotiated Stratum protocol for the live connection: "sv1" or "sv2".
+        # Defaults to sv1 (the classic path) until detection says otherwise.
+        self.protocol = "sv1"
+        self.sv2_detected = False
         self.lock = threading.Lock()
 
     def connect(self) -> bool:
+        """Connect to the pool, auto-negotiating Stratum V1 vs V2.
+
+        Ordering is chosen to be conservative:
+          * A URL that explicitly requests sv2 tries sv2 first, then falls
+            back to sv1 (many sv2 pools also expose an sv1 endpoint).
+          * Otherwise the proven sv1 path is attempted first (identical to
+            the classic behaviour, no added latency for existing pools) and
+            sv2 detection is only attempted if sv1 fails.
+        The negotiated protocol is stored in self.protocol.
+        """
         for attempt in range(10):
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(60)
-                s.connect((self.host, self.port))
-                s.sendall((json.dumps({"id":1,"method":"mining.subscribe",
-                    "params":["AISoloMinerV8/8.0"]})+"\n").encode())
-                resp = json.loads(s.recv(4096).decode().split('\n')[0])
-                if resp.get('result'):
-                    self.extranonce1      = resp['result'][1]
-                    self.extranonce2_size = resp['result'][2]
-                s.sendall((json.dumps({"id":2,"method":"mining.authorize",
-                    "params":[self.address,"x"]})+"\n").encode())
-                s.recv(4096)
-                self.sock = s
-                self.connected = True
-                safe_print(f"[POOL:{self.name}] Connected to {self.host}:{self.port}")
-                LOG.info(f"Connected {self.name} {self.host}:{self.port}")
-                return True
+                if self.protocol_hint == "sv2":
+                    if self._connect_sv2_once():
+                        return True
+                    if self._connect_sv1_once():
+                        return True
+                else:
+                    if self._connect_sv1_once():
+                        return True
+                    if self._connect_sv2_once():
+                        return True
+                raise ConnectionError("stratum handshake failed")
             except Exception as e:
                 wait = min(120, 5*(2**attempt))
                 safe_print(f"[POOL:{self.name}] Retry in {wait}s... ({e})")
                 time.sleep(wait)
         return False
+
+    def _connect_sv1_once(self) -> bool:
+        """Classic Stratum V1 handshake (mining.subscribe / mining.authorize).
+
+        Behaviour is intentionally identical to the original implementation;
+        this is the fully-supported live mining path. Raises on failure so
+        the retry/backoff loop in connect() handles it.
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(60)
+        s.connect((self.host, self.port))
+        s.sendall((json.dumps({"id":1,"method":"mining.subscribe",
+            "params":["AISoloMinerV8/8.0"]})+"\n").encode())
+        resp = json.loads(s.recv(4096).decode().split('\n')[0])
+        if resp.get('result'):
+            self.extranonce1      = resp['result'][1]
+            self.extranonce2_size = resp['result'][2]
+        s.sendall((json.dumps({"id":2,"method":"mining.authorize",
+            "params":[self.address,"x"]})+"\n").encode())
+        s.recv(4096)
+        self.sock = s
+        self.connected = True
+        self.protocol = "sv1"
+        safe_print(f"[POOL:{self.name}] Connected to {self.host}:{self.port} (sv1)")
+        LOG.info(f"Connected {self.name} {self.host}:{self.port} protocol=sv1")
+        return True
+
+    def _probe_sv2(self, timeout=4.0) -> bool:
+        """Best-effort probe to decide whether a pool speaks Stratum V2.
+
+        Stratum V2 opens with a Noise handshake whose first (initiator)
+        message is a raw 32-byte X25519 ephemeral public key. We send that
+        and inspect the reply: an sv2 responder answers with its own binary
+        handshake message, whereas an sv1 endpoint speaks line-based JSON-RPC
+        (or does not answer binary at all). Uses a throwaway socket so the
+        real sv1 handshake, if needed, starts clean.
+        """
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((self.host, self.port))
+            s.sendall(sv2_ephemeral_pubkey())
+            resp = s.recv(1024)
+            if not resp:
+                return False
+            stripped = resp.lstrip()
+            # JSON text => classic sv1, not sv2.
+            if stripped[:1] in (b'{', b'['):
+                return False
+            # A plausible sv2 Noise handshake response is binary and carries
+            # at least the responder's 32-byte ephemeral key.
+            return len(resp) >= 32
+        except Exception:
+            return False
+        finally:
+            if s is not None:
+                try: s.close()
+                except: pass
+
+    def _connect_sv2_once(self) -> bool:
+        """Open a live Stratum V2 standard-channel mining session.
+
+        Performs the Noise_NX_25519_ChaChaPoly_SHA256 handshake, sends
+        SetupConnection, opens a standard mining channel and stores the
+        encrypted transport + channel state on this object. Received jobs are
+        wired into the existing hashing pipeline by listen_for_jobs_sv2().
+
+        Returns True on a live sv2 session, or False (so connect() falls back
+        to the proven sv1 path) if `cryptography` is missing, the pool does
+        not speak the 25519 handshake, or any negotiation step fails.
+        """
+        if not HAS_CRYPTOGRAPHY:
+            safe_print(f"[POOL:{self.name}] sv2 needs the 'cryptography' package; falling back to sv1")
+            LOG.warning(f"Pool {self.name}: sv2 unavailable (no cryptography), protocol stays sv1")
+            return False
+
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(15)
+            s.connect((self.host, self.port))
+
+            transport = Sv2Transport(s)
+            transport.handshake_initiator(self.authority_key)
+            auth_str = "authority key VERIFIED" if transport.cert_verified else \
+                       ("authority key not verified" if self.authority_key else "no authority key")
+            safe_print(f"[POOL:{self.name}] sv2 Noise handshake OK ({auth_str})")
+
+            # --- SetupConnection (Mining Protocol) ---
+            transport.send_message(
+                SV2_MT_SETUP_CONNECTION,
+                sv2_msg_setup_connection(self.host, self.port,
+                                         flags=SV2_FLAG_REQUIRES_STANDARD_JOBS))
+            mt, payload = transport.recv_message()
+            if mt == SV2_MT_SETUP_CONNECTION_ERROR:
+                info = sv2_parse_setup_connection_error(payload)
+                LOG.warning(f"Pool {self.name}: SetupConnection.Error {info}")
+                safe_print(f"[POOL:{self.name}] sv2 SetupConnection error: {info.get('error_code')}")
+                raise Sv2Error("SetupConnection rejected")
+            if mt != SV2_MT_SETUP_CONNECTION_SUCCESS:
+                raise Sv2Error(f"unexpected reply to SetupConnection: 0x{mt:02x}")
+
+            # --- OpenStandardMiningChannel ---
+            user_identity = f"{self.address}.worker"
+            transport.send_message(
+                SV2_MT_OPEN_STANDARD_MINING_CHANNEL,
+                sv2_msg_open_standard_channel(
+                    request_id=1, user_identity=user_identity,
+                    nominal_hash_rate=1.0e9, max_target_int=(2**256 - 1)))
+
+            # Read frames until the channel is opened (SetTarget / early jobs
+            # may arrive first; they are handled after connect by the listener,
+            # but we consume any that precede the success reply here).
+            opened = False
+            for _ in range(20):
+                mt, payload = transport.recv_message()
+                if mt == SV2_MT_OPEN_STANDARD_MINING_CHANNEL_OK:
+                    info = sv2_parse_open_standard_channel_success(payload)
+                    self.sv2_channel_id = info["channel_id"]
+                    self.sv2_extranonce = info["extranonce_prefix"]
+                    self.sv2_target     = info["target"]
+                    opened = True
+                    break
+                elif mt == SV2_MT_OPEN_MINING_CHANNEL_ERROR:
+                    info = sv2_parse_open_channel_error(payload)
+                    safe_print(f"[POOL:{self.name}] sv2 OpenChannel error: {info.get('error_code')}")
+                    raise Sv2Error("OpenStandardMiningChannel rejected")
+                elif mt == SV2_MT_SET_TARGET:
+                    self.sv2_target = sv2_parse_set_target(payload)["maximum_target"]
+                # Jobs (0x1e/0x20) arriving before success are re-requested by
+                # the pool after channel open, so they are safely ignored here.
+            if not opened:
+                raise Sv2Error("no OpenStandardMiningChannel.Success received")
+
+            transport.settimeout(300)
+            self.sv2 = transport
+            self.sock = s
+            self.connected = True
+            self.protocol = "sv2"
+            self.sv2_detected = True
+            safe_print(f"[POOL:{self.name}] Connected to {self.host}:{self.port} (sv2, channel={self.sv2_channel_id})")
+            LOG.info(f"Connected {self.name} {self.host}:{self.port} protocol=sv2 channel={self.sv2_channel_id}")
+            return True
+
+        except Exception as e:
+            LOG.warning(f"Pool {self.name}: sv2 negotiation failed ({e}); will try sv1")
+            if s is not None:
+                try: s.close()
+                except: pass
+            self.sv2 = None
+            return False
+
+    def submit_sv2(self, job_id, nonce_int) -> bool:
+        """Submit a share over sv2 (SubmitSharesStandard). Returns success."""
+        meta = self.sv2_submit_meta.get(job_id)
+        if not meta or not self.sv2:
+            return False
+        submit_nonce = byteswap_u32(nonce_int)
+        with self.lock:
+            seq = self.sv2_seq
+            self.sv2_seq += 1
+        try:
+            self.sv2.send_message(
+                SV2_MT_SUBMIT_SHARES_STANDARD,
+                sv2_msg_submit_shares_standard(
+                    meta["channel_id"], seq, job_id,
+                    submit_nonce, meta["ntime"], meta["version"]),
+                channel_msg=True)
+            return True
+        except Exception as e:
+            LOG.error(f"sv2 submit to {self.name}: {e}")
+            return False
 
     def reconnect(self):
         safe_print(f"[POOL:{self.name}] Reconnecting...")
@@ -691,14 +1592,16 @@ class AISoloMinerV8:
         # Pool connections
         self.pools: List[PoolConnection] = []
         for i, p in enumerate(POOLS):
-            pool = PoolConnection(i, p['name'], p['host'], p['port'], self.address)
+            pool = PoolConnection(i, p['name'], p['host'], p['port'], self.address,
+                                  p.get('authkey'))
             self.pools.append(pool)
 
         # BCH pool connections
         self.bch_pools: List[PoolConnection] = []
         if bch_pools:
             for i, p in enumerate(bch_pools):
-                pool = PoolConnection(100 + i, p['name'], p['host'], p['port'], self.bch_address or self.address)
+                pool = PoolConnection(100 + i, p['name'], p['host'], p['port'],
+                                      self.bch_address or self.address, p.get('authkey'))
                 self.bch_pools.append(pool)
 
         # Stats
@@ -868,6 +1771,156 @@ class AISoloMinerV8:
                 LOG.warning(f"Share REJECTED on {pool.name}: {err}")
         except Exception as e: LOG.error(f"Response[{pool.name}]:{e}")
 
+    # ── SV2 LISTENER / JOB PIPELINE ───────────────────────────
+
+    def listen_for_jobs_sv2(self, pool: PoolConnection):
+        """Read the encrypted sv2 stream, translate NewMiningJob +
+        SetNewPrevHash into the same job dicts the sv1 pipeline feeds to the
+        workers, and route SubmitShares.Success/Error into share stats."""
+        errors = 0
+        while not self.shutdown:
+            tr = pool.sv2
+            if tr is None:
+                time.sleep(1); continue
+            try:
+                mt, payload = tr.recv_message()
+                errors = 0
+            except socket.timeout:
+                continue
+            except Exception as e:
+                LOG.error(f"SV2Listener[{pool.name}]:{e}")
+                errors += 1
+                if errors >= 3:
+                    pool.reconnect(); errors = 0
+                time.sleep(1)
+                continue
+            try:
+                if mt == SV2_MT_NEW_MINING_JOB:
+                    job = sv2_parse_new_mining_job(payload)
+                    pool.sv2_jobs_meta[job['job_id']] = job
+                    LOG.info(f"[SV2:{pool.name}] NewMiningJob id={job['job_id']} future={job['min_ntime'] is None}")
+                    if job['min_ntime'] is not None:
+                        self._dispatch_sv2(pool, job, pool.sv2_prevhash)
+                    elif pool.sv2_prevhash and pool.sv2_prevhash.get('job_id') == job['job_id']:
+                        self._dispatch_sv2(pool, job, pool.sv2_prevhash)
+                elif mt == SV2_MT_SET_NEW_PREV_HASH:
+                    ph = sv2_parse_set_new_prev_hash(payload)
+                    pool.sv2_prevhash = ph
+                    LOG.info(f"[SV2:{pool.name}] SetNewPrevHash job={ph['job_id']}")
+                    job = pool.sv2_jobs_meta.get(ph['job_id'])
+                    if job:
+                        self._dispatch_sv2(pool, job, ph)
+                elif mt == SV2_MT_SET_TARGET:
+                    info = sv2_parse_set_target(payload)
+                    pool.sv2_target = info['maximum_target']
+                    self._apply_sv2_target(pool)
+                elif mt == SV2_MT_SUBMIT_SHARES_SUCCESS:
+                    self._handle_sv2_success(pool, payload)
+                elif mt == SV2_MT_SUBMIT_SHARES_ERROR:
+                    self._handle_sv2_error(pool, payload)
+                elif mt == SV2_MT_RECONNECT:
+                    LOG.info(f"[SV2:{pool.name}] Reconnect requested")
+                    pool.reconnect()
+                # Other message types are safely ignored for standard channels.
+            except Exception as e:
+                LOG.error(f"SV2Dispatch[{pool.name}]:{e}")
+
+    def _apply_sv2_target(self, pool: PoolConnection):
+        """Translate the sv2 channel target into the shared worker share
+        target ratio (same mechanism the sv1 path uses via set_difficulty)."""
+        if pool.sv2_target and pool.sv2_target > 0:
+            ratio = pool.sv2_target / DIFF1
+            self.share_target_v.value = min(max(ratio, 1e-12), 1.0)
+            pool.set_difficulty(max(DIFF1 / pool.sv2_target, 1e-12))
+            LOG.info(f"[SV2:{pool.name}] target={pool.sv2_target:#x} diff={pool.pool_diff:.6f}")
+
+    def _dispatch_sv2(self, pool: PoolConnection, job, prevhash):
+        """Build a worker job dict from an sv2 standard job + prevhash and
+        push it into every worker queue (mirrors _dispatch for sv1)."""
+        if not job or not prevhash:
+            return
+        version  = job['version']
+        merkle   = job['merkle_root']          # raw 32 bytes, header order
+        prev_h   = prevhash['prev_hash']       # raw 32 bytes, header order
+        ntime    = job['min_ntime'] if job['min_ntime'] is not None else prevhash['min_ntime']
+        nbits    = prevhash['nbits']
+
+        prefix = (version.to_bytes(4, 'little').hex()
+                  + prev_h.hex()
+                  + merkle.hex()
+                  + ntime.to_bytes(4, 'little').hex()
+                  + nbits.to_bytes(4, 'little').hex())
+        if len(prefix) != 152:
+            LOG.error(f"[SV2:{pool.name}] bad header prefix len={len(prefix)}")
+            return
+
+        wjob = {
+            'job_id':        job['job_id'],
+            'prevhash':      prev_h.hex(),
+            'coinb1':        '', 'coinb2': '',
+            'merkle_branch': [],
+            'version':       version.to_bytes(4, 'little').hex(),
+            'nbits':         nbits.to_bytes(4, 'little').hex(),
+            'ntime':         ntime.to_bytes(4, 'little').hex(),
+            'clean_jobs':    True,
+            '_prebuilt_prefix': prefix,
+            '_target':       nbits_int_to_target(nbits),   # block target
+            '_en1':          '', '_en2_size': 0,
+            '_pool_id':      pool.pool_id,
+            '_pool_name':    pool.name,
+            '_sv2':          True,
+        }
+        pool.sv2_submit_meta[job['job_id']] = {
+            'version': version, 'ntime': ntime,
+            'channel_id': pool.sv2_channel_id,
+        }
+        # Bound the per-pool job bookkeeping (keep the most recent entries).
+        for _meta in (pool.sv2_jobs_meta, pool.sv2_submit_meta):
+            if len(_meta) > 128:
+                for _k in list(_meta.keys())[:-64]:
+                    _meta.pop(_k, None)
+        pool.job_data = wjob
+        self._apply_sv2_target(pool)
+        safe_print(f"[JOB:{pool.name}] sv2 job {job['job_id']} -> {len(self.job_queues)} workers")
+        for q in self.job_queues:
+            try: q.put_nowait(wjob)
+            except: pass
+
+    def _handle_sv2_success(self, pool: PoolConnection, payload):
+        try:
+            info = sv2_parse_submit_shares_success(payload)
+            n = info.get('new_submits_accepted_count', 1) or 1
+            with self.stats_lock:
+                self.shares_accepted[pool.name] = self.shares_accepted.get(pool.name, 0) + n
+                acc = self.shares_accepted[pool.name]
+                self.share_times.append(time.time())
+                if len(self.share_times) > 20: self.share_times.pop(0)
+            safe_print(f"[SHARE:{pool.name}] sv2 ACCEPTED! Total={acc}")
+            LOG.info(f"Share ACCEPTED on {pool.name} (sv2)")
+            engine = self.last_submit_engine.get(pool.name, "CPU")
+            self.telegram.notify_share_accepted(pool.name, acc, engine)
+        except Exception as e:
+            LOG.error(f"SV2Success[{pool.name}]:{e}")
+
+    def _handle_sv2_error(self, pool: PoolConnection, payload):
+        try:
+            info = sv2_parse_submit_shares_error(payload)
+            with self.stats_lock:
+                self.shares_rejected[pool.name] = self.shares_rejected.get(pool.name, 0) + 1
+            safe_print(f"[SHARE:{pool.name}] sv2 REJECTED: {info.get('error_code')}")
+            LOG.warning(f"Share REJECTED on {pool.name} (sv2): {info.get('error_code')}")
+        except Exception as e:
+            LOG.error(f"SV2Error[{pool.name}]:{e}")
+
+    def _find_pool(self, pool_id):
+        for p in self.pools:
+            if p.pool_id == pool_id:
+                return p
+        for p in self.bch_pools:
+            if p.pool_id == pool_id:
+                return p
+        return self.pools[0] if self.pools else None
+
     # ── RESULT COLLECTOR ──────────────────────────────────────
 
     def collect_results(self):
@@ -925,13 +1978,16 @@ class AISoloMinerV8:
             if self._bloom_check_add(key): return
 
             pool_id = msg.get('_pool_id', 0)
-            pool = self.pools[pool_id] if pool_id < len(self.pools) else self.pools[0]
+            pool = self._find_pool(pool_id) or self.pools[0]
 
             nonce_hex = format(msg['nonce'],'08x')
             is_gpu = msg.get('core_id', 0) >= 999
             engine = "GPU" if is_gpu else "CPU"
-            ok = pool.submit(self.address, msg['job_id'], msg['en2'],
-                           msg['ntime'], nonce_hex)
+            if pool.protocol == "sv2" and pool.sv2 is not None:
+                ok = pool.submit_sv2(msg['job_id'], msg['nonce'])
+            else:
+                ok = pool.submit(self.address, msg['job_id'], msg['en2'],
+                               msg['ntime'], nonce_hex)
             if ok:
                 with self.stats_lock:
                     self.last_submit_engine[pool.name] = engine
@@ -1122,27 +2178,9 @@ class AISoloMinerV8:
                 for p in self.pools:
                     st = "ONLINE" if p.connected else "OFFLINE"
                     hr = pool_hrs.get(p.name, 0.0)
-                    lines.append(f"    {p.name:8s} {st:8s}  HR={fmt_hr(hr):>10s}  diff={p.pool_diff:.2f}  acc={acc.get(p.name,0)} rej={rej.get(p.name,0)}")
+                    lines.append(f"    {p.name:8s} {st:8s} [{p.protocol}]  HR={fmt_hr(hr):>10s}  diff={p.pool_diff:.2f}  acc={acc.get(p.name,0)} rej={rej.get(p.name,0)}")
 
-    # Telegram notifications
-    print()
-    tg_choice = input("  Enable Telegram notifications? (y/n) [n]: ").strip().lower()
-    use_tg = tg_choice in ("y", "yes")
-
-    tg_token = ""
-    tg_chat = ""
-    if use_tg:
-        tg_token = input("  Telegram Bot Token: ").strip()
-        tg_chat = input("  Telegram Chat ID: ").strip()
-        if tg_token and tg_chat:
-            print("  Telegram notifications enabled")
-        else:
-            print("  Telegram disabled (missing token or chat ID)")
-            use_tg = False
-            tg_token = ""
-            tg_chat = ""
-
-    # GPU
+                # GPU
                 if self.gpu_workers:
                     gpu_p = self.gpu_workers[0]
                     gpu_st = "RUNNING" if gpu_p.is_alive() else "DEAD"
@@ -1279,8 +2317,10 @@ class AISoloMinerV8:
         all_pools = self.pools + self.bch_pools
         for pool in all_pools:
             if pool.connected:
+                target = (self.listen_for_jobs_sv2
+                          if pool.protocol == "sv2" else self.listen_for_jobs)
                 threading.Thread(
-                    target=self.listen_for_jobs,
+                    target=target,
                     args=(pool,),
                     daemon=True
                 ).start()
@@ -1445,17 +2485,121 @@ DEFAULT_POOLS = [
 ]
 
 KNOWN_POOLS = {
-    "1": {"name": "ckpool",  "host": "solo.ckpool.org",         "port": 3333, "label": "ckpool (solo.ckpool.org:3333)"},
-    "2": {"name": "braiins", "host": "solo.stratum.braiins.com", "port": 3333, "label": "braiins (solo.stratum.braiins.com:3333)"},
-    "3": {"name": "publicpool", "host": "public-pool.io",       "port": 3333, "label": "publicpool (public-pool.io:3333)"},
-    "4": {"name": "minerpool",  "host": "solo.minerpool.com",   "port": 3333, "label": "minerpool (solo.minerpool.com:3333)"},
+    "1": {"name": "ckpool",  "host": "solo.ckpool.org",         "port": 3333, "label": "ckpool (solo.ckpool.org:3333) [sv1]"},
+    "2": {"name": "braiins", "host": "solo.stratum.braiins.com", "port": 3333, "label": "braiins (solo.stratum.braiins.com:3333) [sv1]"},
+    "3": {"name": "publicpool", "host": "public-pool.io",       "port": 3333, "label": "publicpool (public-pool.io:3333) [sv1]"},
+    "4": {"name": "minerpool",  "host": "solo.minerpool.com",   "port": 3333, "label": "minerpool (solo.minerpool.com:3333) [sv1]"},
+    "5": {"name": "mkpool-bc2", "host": "stratum2+tcp://bc2.mkpool.com", "port": 3360,
+          "authkey": MKPOOL_BC2_AUTHORITY_KEY,
+          "label": "mkpool BitcoinII/bc2 (bc2.mkpool.com:3360) [sv2]"},
 }
+
+
+def parse_pool_arg(s):
+    """Parse a pool spec 'scheme://host:port/AUTHKEY' (any part optional) into
+    a pool dict with name/host/port/authkey. The scheme is preserved on the
+    host so PoolConnection auto-negotiates sv1 vs sv2."""
+    s = (s or "").strip()
+    scheme = ""
+    low = s.lower()
+    for sch in SV2_SCHEMES + SV1_SCHEMES:
+        if low.startswith(sch):
+            scheme = s[:len(sch)]
+            s = s[len(sch):]
+            break
+    authkey = None
+    if "/" in s:
+        s, _, path = s.partition("/")
+        if path:
+            authkey = path
+    if ":" in s:
+        host, _, port_str = s.rpartition(":")
+        try: port = int(port_str)
+        except ValueError: host, port = s, 3333
+    else:
+        host, port = s, 3333
+    name = (host.split(".")[0] or "pool")
+    return {"name": name, "host": scheme + host, "port": port, "authkey": authkey}
 
 KNOWN_BCH_POOLS = {
     "1": {"name": "bchpool",   "host": "solo.bchpool.org",      "port": 3333, "label": "bchpool (solo.bchpool.org:3333)"},
     "2": {"name": "bchpublic", "host": "public-pool.bch.ninja", "port": 3333, "label": "bchpublic (public-pool.bch.ninja:3333)"},
     "3": {"name": "bmcpool",   "host": "solo.bmcpool.org",      "port": 3333, "label": "bmcpool (solo.bmcpool.org:3333)"},
 }
+
+
+def _prompt_one_pool(known_pools, default_pool, index):
+    """Prompt the user to pick a single pool from `known_pools` or enter a
+    custom one, returning a pool dict {name, host, port, authkey}.
+
+    `index` (0-based) chooses which known-pool key is offered as the default so
+    dual setups suggest a different pool per slot. Each pool independently
+    supports SV1 or SV2: a custom sv2 host (stratum2+tcp:// prefix) additionally
+    prompts for the pool's SV2 authority key."""
+    keys = list(known_pools.keys())
+    default_key = keys[index] if index < len(keys) else keys[0]
+    choice = input(f"    Select pool [{default_key}]: ").strip()
+    if not choice:
+        choice = default_key
+
+    if choice.upper() in ("C", "CUSTOM"):
+        name = input("    Pool name: ").strip() or f"custom{index+1}"
+        print("    Pool host (add stratum2+tcp:// prefix for Stratum V2)")
+        host = input("    Pool host: ").strip()
+        port_str = input("    Pool port [3333]: ").strip()
+        port = int(port_str) if port_str else 3333
+        # For sv2 pools, offer to capture the pool's authority key.
+        _, hint = parse_pool_scheme(host)
+        authkey = None
+        if hint == "sv2" or "mkpool" in host.lower():
+            default_ak = MKPOOL_BC2_AUTHORITY_KEY if "mkpool" in host.lower() else ""
+            prompt = f"    SV2 authority key [{default_ak or 'none'}]: "
+            ak = input(prompt).strip() or default_ak
+            authkey = ak or None
+        return {"name": name, "host": host, "port": port, "authkey": authkey}
+    elif choice in known_pools:
+        p = known_pools[choice]
+        print(f"    -> {p['label']}")
+        return {"name": p["name"], "host": p["host"], "port": p["port"],
+                "authkey": p.get("authkey")}
+    else:
+        print(f"    Invalid choice, using {default_pool['name']}")
+        return dict(default_pool)
+
+
+def _prompt_pool_set(coin_label, known_pools, default_pools):
+    """Prompt for one or two pools for a coin.
+
+    Offers a single vs dual choice; when dual is selected the wizard explicitly
+    asks for the FIRST pool (primary) and then the SECOND pool (backup), storing
+    them in order so index 0 is the primary and index 1 is the failover/backup.
+    Returns a list of pool dicts."""
+    print()
+    print(f"  Available {coin_label} pools:")
+    for k, v in known_pools.items():
+        print(f"    [{k}] {v['label']}")
+    print(f"    [C] Custom pool")
+    print()
+
+    pool_count = input("  Use (1) one pool or (2) dual pools (primary + backup)? [1/2]: ").strip()
+    num_pools = 2 if pool_count == "2" else 1
+
+    pools = []
+    if num_pools == 1:
+        print()
+        pools.append(_prompt_one_pool(known_pools, default_pools[0], 0))
+    else:
+        print()
+        print("  Dual pools selected: enter your FIRST pool, then your SECOND pool.")
+        print()
+        print("  --- Pool #1 (primary) ---")
+        pools.append(_prompt_one_pool(known_pools, default_pools[0], 0))
+        print()
+        print("  --- Pool #2 (backup) ---")
+        backup_default = default_pools[1] if len(default_pools) > 1 else default_pools[0]
+        pools.append(_prompt_one_pool(known_pools, backup_default, 1))
+    return pools
+
 
 def interactive_setup():
     """Prompt user for configuration when no CLI args are given."""
@@ -1468,48 +2612,39 @@ def interactive_setup():
     print("=" * 60)
     print()
 
-    # BTC Address
-    addr = input(f"  Bitcoin address [{BTC_ADDRESS}]: ").strip()
-    if not addr:
-        addr = BTC_ADDRESS
-        print(f"  Using default: {addr}")
-
-    # Pool selection
-    print()
-    print("  Available pools:")
-    for k, v in KNOWN_POOLS.items():
-        print(f"    [{k}] {v['label']}")
-    print(f"    [C] Custom pool")
-    print()
-
-    pool_count = input("  Use (1) one pool or (2) dual pools? [1/2]: ").strip()
-    if pool_count == "2":
-        num_pools = 2
+    # Coin selection
+    print("  Which coin(s) do you want to mine?")
+    print("    [1] Bitcoin (BTC)")
+    print("    [2] Bitcoin Cash (BCH)")
+    print("    [3] Both")
+    coin_choice = input("  Select coin(s) [1]: ").strip()
+    if not coin_choice:
+        coin_choice = "1"
+    if coin_choice == "2":
+        mine_btc = False
+        mine_bch = True
+        print("  -> Mining Bitcoin Cash (BCH)")
+    elif coin_choice == "3":
+        mine_btc = True
+        mine_bch = True
+        print("  -> Mining both Bitcoin (BTC) and Bitcoin Cash (BCH)")
     else:
-        num_pools = 1
+        mine_btc = True
+        mine_bch = False
+        print("  -> Mining Bitcoin (BTC)")
 
+    # BTC Address + pool selection (only when mining Bitcoin)
+    addr = BTC_ADDRESS
     selected_pools = []
-    for i in range(num_pools):
+    if mine_btc:
         print()
-        if num_pools > 1:
-            print(f"  --- Pool {i+1} ---")
-        choice = input(f"  Select pool [{list(KNOWN_POOLS.keys())[i]}]: ").strip()
-        if not choice:
-            choice = list(KNOWN_POOLS.keys())[i]
+        addr = input(f"  Bitcoin address [{BTC_ADDRESS}]: ").strip()
+        if not addr:
+            addr = BTC_ADDRESS
+            print(f"  Using default: {addr}")
 
-        if choice.upper() == "C" or choice.upper() == "CUSTOM":
-            name = input("    Pool name: ").strip() or f"custom{i+1}"
-            host = input("    Pool host: ").strip()
-            port_str = input("    Pool port [3333]: ").strip()
-            port = int(port_str) if port_str else 3333
-            selected_pools.append({"name": name, "host": host, "port": port})
-        elif choice in KNOWN_POOLS:
-            p = KNOWN_POOLS[choice]
-            selected_pools.append({"name": p["name"], "host": p["host"], "port": p["port"]})
-            print(f"    -> {p['label']}")
-        else:
-            print(f"    Invalid choice, using ckpool")
-            selected_pools.append(dict(DEFAULT_POOLS[0]))
+        # Pool selection (single or dual: primary + backup)
+        selected_pools = _prompt_pool_set("BTC", KNOWN_POOLS, DEFAULT_POOLS)
 
     # GPU
     print()
@@ -1534,14 +2669,12 @@ def interactive_setup():
         else:
             print("  GPU auto-adaptive difficulty enabled")
 
-    # BCH
-    print()
-    bch_choice = input("  Enable BCH dual mining? (y/n) [n]: ").strip().lower()
-    use_bch = bch_choice in ("y", "yes")
-
+    # BCH (only when mining Bitcoin Cash)
+    use_bch = mine_bch
     bch_address = None
     bch_pools = []
     if use_bch:
+        print()
         bch_addr = input("  Bitcoin Cash address: ").strip()
         if not bch_addr:
             print("  BCH address is required for BCH mining.")
@@ -1549,21 +2682,26 @@ def interactive_setup():
         else:
             bch_address = bch_addr
 
-            print()
-            print("  BCH Pool:")
-            for k, v in KNOWN_BCH_POOLS.items():
-                print(f"    [{k}] {v['label']}")
-            print()
-            bch_choice = input("  Select BCH pool [1]: ").strip()
-            if not bch_choice:
-                bch_choice = "1"
-            if bch_choice in KNOWN_BCH_POOLS:
-                p = KNOWN_BCH_POOLS[bch_choice]
-                bch_pools.append({"name": p["name"], "host": p["host"], "port": p["port"]})
-                print(f"    -> {p['label']}")
-            else:
-                print(f"    Invalid choice, using bchpool")
-                bch_pools.append(dict(BCH_POOLS[0]))
+            # BCH pool selection (single or dual: primary + backup)
+            bch_pools = _prompt_pool_set("BCH", KNOWN_BCH_POOLS, BCH_POOLS)
+
+    # Telegram notifications
+    print()
+    tg_choice = input("  Enable Telegram notifications? (y/n) [n]: ").strip().lower()
+    use_tg = tg_choice in ("y", "yes")
+
+    tg_token = ""
+    tg_chat = ""
+    if use_tg:
+        tg_token = input("  Telegram Bot Token: ").strip()
+        tg_chat = input("  Telegram Chat ID: ").strip()
+        if tg_token and tg_chat:
+            print("  Telegram notifications enabled")
+        else:
+            print("  Telegram disabled (missing token or chat ID)")
+            use_tg = False
+            tg_token = ""
+            tg_chat = ""
 
     # Cores
     avail = mp.cpu_count()
@@ -1579,9 +2717,12 @@ def interactive_setup():
 
     print()
     print("-" * 60)
-    print(f"  Address : {addr}")
-    pool_str = " + ".join([f"{p['host']}:{p['port']}" for p in selected_pools])
-    print(f"  Pools   : {pool_str}")
+    coins_str = " + ".join([c for c, on in (("BTC", mine_btc), ("BCH", use_bch)) if on]) or "None"
+    print(f"  Coins   : {coins_str}")
+    if mine_btc:
+        print(f"  Address : {addr}")
+        pool_str = " + ".join([f"{p['host']}:{p['port']}" for p in selected_pools])
+        print(f"  Pools   : {pool_str}")
     print(f"  GPU     : {'Enabled' if use_gpu else 'Disabled'}")
     if use_gpu:
         if gpu_difficulty > 0:
@@ -1624,7 +2765,15 @@ def main():
     parser.add_argument('--pool2', default=None, help='Pool 2 host:port (e.g. solo.stratum.braiins.com:3333)')
     parser.add_argument('--bch-pool', default=None, help='BCH pool host:port (e.g. solo.bchpool.org:3333)')
     parser.add_argument('--no-prompt', action='store_true', help='Skip interactive setup, use defaults')
+    parser.add_argument('--selftest', action='store_true', help='Run sv2 codec/handshake self-checks and exit')
     args = parser.parse_args()
+
+    if args.selftest:
+        sys.exit(0 if sv2_selftest() else 1)
+
+    # gpu_only is only ever set via CLI; define it up front so the interactive
+    # path doesn't hit an UnboundLocalError when it is passed to the miner.
+    gpu_only = args.gpu_only
 
     # Interactive setup if no address and not --no-prompt
     if args.address is None and not args.no_prompt:
@@ -1644,15 +2793,12 @@ def main():
         bch_address = None
         bch_pools = []
 
-        # Parse pools from CLI
+        # Parse pools from CLI (supports sv2 URLs, e.g.
+        # "stratum2+tcp://bc2.mkpool.com:3360/AUTHKEY").
         selected_pools = []
         for pool_arg in [args.pool1, args.pool2]:
             if pool_arg:
-                parts = pool_arg.split(":")
-                host = parts[0]
-                port = int(parts[1]) if len(parts) > 1 else 3333
-                name = host.split(".")[0]
-                selected_pools.append({"name": name, "host": host, "port": port})
+                selected_pools.append(parse_pool_arg(pool_arg))
 
         if not selected_pools:
             selected_pools = list(DEFAULT_POOLS)
@@ -1669,11 +2815,7 @@ def main():
                 bch_address = BCH_ADDRESS
                 print("[INIT] BCH enabled with default address. Use --bch-addr to set your address.")
             if args.bch_pool:
-                parts = args.bch_pool.split(":")
-                host = parts[0]
-                port = int(parts[1]) if len(parts) > 1 else 3333
-                name = host.split(".")[0]
-                bch_pools.append({"name": name, "host": host, "port": port})
+                bch_pools.append(parse_pool_arg(args.bch_pool))
             else:
                 bch_pools = [{"name": "bchpool", "host": "solo.bchpool.org", "port": 3333}]
 
