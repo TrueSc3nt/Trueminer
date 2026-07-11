@@ -47,8 +47,7 @@ POOLS = [
 
 # BCH pool definitions
 BCH_POOLS = [
-    {"name": "bchpool",    "host": "solo.bchpool.org",         "port": 3333},
-    {"name": "bchpublic",  "host": "public-pool.bch.ninja",    "port": 3333},
+    {"name": "solopool", "host": "bch.solopool.eu", "port": 3333},
 ]
 
 if IS_WINDOWS:
@@ -2522,9 +2521,7 @@ def parse_pool_arg(s):
     return {"name": name, "host": scheme + host, "port": port, "authkey": authkey}
 
 KNOWN_BCH_POOLS = {
-    "1": {"name": "bchpool",   "host": "solo.bchpool.org",      "port": 3333, "label": "bchpool (solo.bchpool.org:3333)"},
-    "2": {"name": "bchpublic", "host": "public-pool.bch.ninja", "port": 3333, "label": "bchpublic (public-pool.bch.ninja:3333)"},
-    "3": {"name": "bmcpool",   "host": "solo.bmcpool.org",      "port": 3333, "label": "bmcpool (solo.bmcpool.org:3333)"},
+    "1": {"name": "solopool", "host": "bch.solopool.eu", "port": 3333, "label": "solopool (bch.solopool.eu:3333)"},
 }
 
 
@@ -2817,7 +2814,7 @@ def main():
             if args.bch_pool:
                 bch_pools.append(parse_pool_arg(args.bch_pool))
             else:
-                bch_pools = [{"name": "bchpool", "host": "solo.bchpool.org", "port": 3333}]
+                bch_pools = [{"name": "solopool", "host": "bch.solopool.eu", "port": 3333}]
 
     # Apply pool config
     POOLS.clear()
