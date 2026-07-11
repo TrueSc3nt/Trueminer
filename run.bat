@@ -31,22 +31,34 @@ set /p diff="  Select GPU difficulty [0]: "
 if "%diff%"=="" set diff=0
 
 echo.
+echo   Wallet / payout address (REQUIRED for solo mining):
+echo     Used as your pool username - solo pools send NO work without a valid address.
+set /p btc_addr="  Your BTC address: "
+set ADDR_ARG=
+if defined btc_addr set ADDR_ARG="!btc_addr!"
+if not defined btc_addr echo   WARNING: no address entered - the pool will likely send no work.
+
+set BCH_ADDR_FLAG=
+if "!BCH_MODE!"=="1" (
+    set /p bch_addr="  Your BCH address (Enter to reuse BTC address): "
+    if defined bch_addr set BCH_ADDR_FLAG=--bch-addr "!bch_addr!"
+)
+
+echo.
 echo   Pool configuration:
 echo     [Enter] = keep default pools (solo.ckpool.org:3333 + solo.stratum.braiins.com:3333)
-echo     Enter pools as host:port  (for Stratum V2 use stratum2+tcp://host:port/AUTHKEY)
-set /p pool_custom="  Enter custom pools? (y/n) [n]: "
+echo     Or type your pool as host:port  (Stratum V2: stratum2+tcp://host:port/AUTHKEY)
 set POOL_FLAG=
 set BCH_POOL_FLAG=
-if /I "!pool_custom!"=="y" (
-    echo.
-    set /p pool1="  BTC Pool #1 (primary): "
+set /p pool1="  BTC Pool #1 (primary) [Enter=default]: "
+if defined pool1 (
+    set POOL_FLAG=--pool1 "!pool1!"
     set /p pool2="  BTC Pool #2 (backup, optional): "
-    if defined pool1 set POOL_FLAG=!POOL_FLAG! --pool1 "!pool1!"
     if defined pool2 set POOL_FLAG=!POOL_FLAG! --pool2 "!pool2!"
-    if "!BCH_MODE!"=="1" (
-        set /p bch_pool="  BCH Pool (host:port, optional): "
-        if defined bch_pool set BCH_POOL_FLAG=--bch-pool "!bch_pool!"
-    )
+)
+if "!BCH_MODE!"=="1" (
+    set /p bch_pool="  BCH Pool (host:port) [Enter=default]: "
+    if defined bch_pool set BCH_POOL_FLAG=--bch-pool "!bch_pool!"
 )
 
 echo.
@@ -72,8 +84,8 @@ if not "%diff%"=="0" (
 
 if "%choice%"=="2" (
     echo Starting BTC mining with CPU only...
-    python miner.py --no-prompt %POOL_FLAG% %BCH_POOL_FLAG% %TG_FLAG%
+    python miner.py %ADDR_ARG% --no-prompt %POOL_FLAG% %BCH_POOL_FLAG% %BCH_ADDR_FLAG% %TG_FLAG%
 ) else (
-    python miner.py %GPU_FLAG% --no-prompt %POOL_FLAG% %BCH_POOL_FLAG% %TG_FLAG%
+    python miner.py %ADDR_ARG% %GPU_FLAG% --no-prompt %POOL_FLAG% %BCH_POOL_FLAG% %BCH_ADDR_FLAG% %TG_FLAG%
 )
 pause
